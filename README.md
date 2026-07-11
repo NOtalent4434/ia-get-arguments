@@ -11,7 +11,7 @@
 
 <p align="center">Made with 💝 by 🤖</p>
 <br>
-<h1>For More Information about this fork read [FORK-DOC.md](https://github.com/NOtalent4434/ia-get-arguments/blob/main/FORK-DOC.md) </h1>
+<h2>For More Information about this fork read <h2><a href="[https://github.com](https://github.com/NOtalent4434/ia-get-arguments/blob/main/FORK-DOC.md)">FORK-DOC.md</a></h2> </h2>
 <br>
 # Usage 📖
 
