@@ -12,7 +12,7 @@ Everything the original program does still works. This document covers **what ch
 | **Config file** | None | Optional `ia-get.ini` (bandwidth cap, parallel downloads) |
 | **Download speed** | Unlimited, one file at a time | Configurable global bandwidth limit (KB/s) |
 | **Parallel downloads** | Always sequential | Optional multithreading (`threads` setting) |
-| **Extension filters** | Not supported | `*ext` include, `#ext` exclude (after URL) |
+| **Extension filters** | N/A | `*ext` include, `#ext` exclude (after URL) |
 | **Filtered file layout** | N/A | Flat basename by default; optional `-k` / `-pk` |
 | **Unfiltered download layout** | Full archive tree preserved | Same as original |
 | **Cookies** | `--cookies` / `-b` (file or raw header) | Same as original |
