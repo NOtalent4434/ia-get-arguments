@@ -1,5 +1,5 @@
 <br>
-<h2>For More Information about this fork read <a href="FORK-DOC.md">FORK-DOC.md</a> </h2>
+<h2>For Information about this fork read <a href="FORK-DOC.md">FORK-DOC.md</a> </h2>
 <br>
 
 <h1 align="center">
