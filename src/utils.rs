@@ -3,9 +3,13 @@
 use crate::constants::URL_PATTERN;
 use crate::{IaGetError, Result};
 use colored::*;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::Regex;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
+use std::fs;
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 /// Spinner tick interval in milliseconds
 pub const SPINNER_TICK_INTERVAL: u64 = 100;
@@ -65,6 +69,20 @@ pub fn create_progress_bar(
     color: Option<&str>,
     with_eta: bool,
 ) -> ProgressBar {
+    create_progress_bar_in(total, action, color, with_eta, None)
+}
+
+/// Create a progress bar, optionally attached to a [`MultiProgress`] manager.
+///
+/// When `multi_progress` is set, the bar is drawn on its own line so concurrent
+/// downloads do not overwrite each other.
+pub fn create_progress_bar_in(
+    total: u64,
+    action: &str,
+    color: Option<&str>,
+    with_eta: bool,
+    multi_progress: Option<&MultiProgress>,
+) -> ProgressBar {
     let pb = ProgressBar::new(total);
     let color_str = color.unwrap_or("green/green");
 
@@ -78,7 +96,7 @@ pub fn create_progress_bar(
 
     let template = if with_eta {
         format!(
-            "{}{{elapsed_precise}} {{bar:40.{}}} {{bytes}}/{{total_bytes}} (ETA: {{eta}})",
+            "{}{{elapsed_precise}} {{bar:40.{}}} {{bytes}}/{{total_bytes}} {{wide_msg}}",
             styled_action, color_str
         )
     } else {
@@ -95,7 +113,64 @@ pub fn create_progress_bar(
             .progress_chars("▓▒░"),
     );
 
-    pb
+    match multi_progress {
+        Some(manager) => manager.add(pb),
+        None => pb,
+    }
+}
+
+/// Truncate a filename label for compact progress-bar display in narrow terminals.
+fn truncate_file_label(label: &str, max_chars: usize) -> String {
+    let char_count = label.chars().count();
+    if char_count <= max_chars {
+        return label.to_string();
+    }
+
+    let trimmed: String = label.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{trimmed}…")
+}
+
+/// Create a progress bar for one slot in a parallel download view.
+///
+/// Each bar is inserted at a fixed index so concurrent downloads keep a stable,
+/// ordered layout in Windows CMD and other terminals.
+pub fn create_parallel_progress_bar(
+    multi_progress: &MultiProgress,
+    slot: usize,
+    total: u64,
+    action: &str,
+    file_label: &str,
+    color: Option<&str>,
+    with_eta: bool,
+) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    let color_str = color.unwrap_or("green/green");
+    let display_label = truncate_file_label(file_label, 26);
+    let prefix = format!(
+        "{} {} {} ",
+        "╰╼".cyan().dimmed(),
+        action.white(),
+        display_label.dimmed()
+    );
+
+    let template = if with_eta {
+        format!(
+            "{prefix}{{elapsed_precise}} {{bar:28.{color_str}}} {{bytes}}/{{total_bytes}} {{wide_msg}}"
+        )
+    } else {
+        format!(
+            "{prefix}{{elapsed_precise}} {{bar:28.{color_str}}} {{bytes}}/{{total_bytes}}"
+        )
+    };
+
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(&template)
+            .expect("Failed to set parallel progress bar style")
+            .progress_chars("▓▒░"),
+    );
+
+    multi_progress.insert(slot, pb)
 }
 
 /// Create a spinner with braille animation
@@ -115,6 +190,104 @@ pub fn create_spinner(message: &str) -> ProgressBar {
     );
     spinner.enable_steady_tick(std::time::Duration::from_millis(SPINNER_TICK_INTERVAL));
     spinner
+}
+
+/// Rolling download speed calculator (aria2 `SpeedCalc`, 10-second window).
+#[derive(Debug, Clone)]
+pub struct SpeedCalc {
+    time_slots: VecDeque<(Instant, u64)>,
+    bytes_window: u64,
+    accumulated_length: u64,
+}
+
+const SPEED_WINDOW: Duration = Duration::from_secs(10);
+
+impl SpeedCalc {
+    pub fn new() -> Self {
+        Self {
+            time_slots: VecDeque::new(),
+            bytes_window: 0,
+            accumulated_length: 0,
+        }
+    }
+
+    pub fn accumulated_length(&self) -> u64 {
+        self.accumulated_length
+    }
+
+    pub fn update(&mut self, bytes: u64) {
+        let now = Instant::now();
+        self.remove_stale(now);
+
+        if let Some((last_time, last_bytes)) = self.time_slots.back_mut() {
+            if now.duration_since(*last_time) < Duration::from_secs(1) {
+                *last_bytes += bytes;
+            } else {
+                self.time_slots.push_back((now, bytes));
+            }
+        } else {
+            self.time_slots.push_back((now, bytes));
+        }
+
+        self.bytes_window += bytes;
+        self.accumulated_length += bytes;
+    }
+
+    /// Current transfer speed in bytes per second (aria2 `calculateSpeed`).
+    pub fn speed_bps(&mut self) -> u64 {
+        let now = Instant::now();
+        self.remove_stale(now);
+
+        if self.time_slots.is_empty() {
+            return 0;
+        }
+
+        let elapsed_ms = now
+            .duration_since(self.time_slots.front().expect("slot").0)
+            .as_millis()
+            .max(1) as u64;
+
+        self.bytes_window.saturating_mul(1000) / elapsed_ms
+    }
+
+    fn remove_stale(&mut self, now: Instant) {
+        while let Some((time, _)) = self.time_slots.front() {
+            if now.duration_since(*time) <= SPEED_WINDOW {
+                break;
+            }
+            if let Some((_, bytes)) = self.time_slots.pop_front() {
+                self.bytes_window = self.bytes_window.saturating_sub(bytes);
+            }
+        }
+    }
+}
+
+/// ETA in seconds using aria2's formula: `(total - completed) / speed`.
+pub fn eta_seconds(total: u64, completed: u64, speed_bps: u64) -> Option<u64> {
+    if speed_bps == 0 || completed >= total {
+        return None;
+    }
+    Some((total - completed).div_ceil(speed_bps))
+}
+
+pub fn format_progress_eta_message(total: u64, completed: u64, speed_bps: u64) -> String {
+    eta_seconds(total, completed, speed_bps)
+        .map(|secs| format!("(ETA: {})", format_duration(Duration::from_secs(secs))))
+        .unwrap_or_default()
+}
+
+/// Update a progress bar using session transfer stats (resume-safe ETA).
+pub fn update_transfer_progress_bar(
+    pb: &ProgressBar,
+    speed: &mut SpeedCalc,
+    baseline_completed: u64,
+    total: u64,
+    session_chunk: u64,
+) {
+    speed.update(session_chunk);
+    let completed = baseline_completed.saturating_add(speed.accumulated_length());
+    pb.set_position(completed);
+    pb.set_message(format_progress_eta_message(total, completed, speed.speed_bps()));
 }
 
 /// Format a duration into a human-readable string
@@ -163,6 +336,114 @@ pub fn format_transfer_rate(bytes_per_sec: f64) -> (f64, &'static str) {
     } else {
         (bytes_per_sec / gb, "GB")
     }
+}
+
+/// Parsed include/exclude extension filters from the CLI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionFilterSpec {
+    pub includes: Vec<String>,
+    pub excludes: Vec<String>,
+}
+
+/// Split CLI filter args into include (`*apk`) and exclude (`#jpg`) groups.
+pub fn split_extension_filter_args(filters: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+
+    for filter in filters {
+        if filter.starts_with('*') {
+            includes.push(filter.clone());
+        } else if filter.starts_with('#') {
+            excludes.push(filter.clone());
+        } else {
+            return Err(IaGetError::UrlFormat(format!(
+                "Invalid filter '{filter}'. Use *ext to include or #ext to exclude, for example *apk or #jpg"
+            )));
+        }
+    }
+
+    Ok((includes, excludes))
+}
+
+/// Parse include and exclude filters from the CLI into normalized extensions.
+pub fn parse_extension_filters(filters: &[String]) -> Result<ExtensionFilterSpec> {
+    let (includes, excludes) = split_extension_filter_args(filters)?;
+    Ok(ExtensionFilterSpec {
+        includes: normalize_extension_filters(&includes)?,
+        excludes: normalize_extension_excludes(&excludes)?,
+    })
+}
+
+/// Convert CLI excludes like `#jpg` into normalized extensions like `.jpg`.
+pub fn normalize_extension_excludes(excludes: &[String]) -> Result<Vec<String>> {
+    excludes
+        .iter()
+        .map(|filter| {
+            if !filter.starts_with('#') {
+                return Err(IaGetError::UrlFormat(format!(
+                    "Invalid exclude '{filter}'. Excludes must start with #, for example #jpg or #torrent"
+                )));
+            }
+            let ext = filter.trim_start_matches('#').trim_start_matches('.');
+            if ext.is_empty() {
+                return Err(IaGetError::UrlFormat(
+                    "Invalid exclude. Provide an extension after #, for example #jpg".to_string(),
+                ));
+            }
+            Ok(format!(".{}", ext.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+/// Convert CLI filters like `*apk` into normalized extensions like `.apk`.
+pub fn normalize_extension_filters(filters: &[String]) -> Result<Vec<String>> {
+    filters
+        .iter()
+        .map(|filter| {
+            if !filter.starts_with('*') {
+                return Err(IaGetError::UrlFormat(format!(
+                    "Invalid filter '{filter}'. Filters must start with *, for example *apk or *xapk"
+                )));
+            }
+            let ext = filter.trim_start_matches('*').trim_start_matches('.');
+            if ext.is_empty() {
+                return Err(IaGetError::UrlFormat(
+                    "Invalid filter. Provide an extension after *, for example *apk".to_string(),
+                ));
+            }
+            Ok(format!(".{}", ext.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+/// Returns true when no filters are set, or when the filename ends with one of them.
+pub fn file_matches_extension_filters(filename: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let lower = filename.to_ascii_lowercase();
+    filters.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Returns true when a file should be downloaded given include/exclude filters.
+///
+/// With no includes, all files are candidates. With no excludes, nothing is blocked.
+pub fn file_passes_extension_filters(
+    filename: &str,
+    includes: &[String],
+    excludes: &[String],
+) -> bool {
+    if !file_matches_extension_filters(filename, includes) {
+        return false;
+    }
+
+    if excludes.is_empty() {
+        return true;
+    }
+
+    let lower = filename.to_ascii_lowercase();
+    !excludes.iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Sanitizes a filename for cross-platform filesystem compatibility
@@ -306,6 +587,75 @@ pub fn sanitize_filename(filename: &str) -> (String, bool) {
     }
 
     (result, was_modified)
+}
+
+/// Resolve the local download path for an archive file entry.
+///
+/// Without include/exclude filters, the full sanitized archive path is always used.
+///
+/// With filters and `keep_folder_structure` or `partial_folder_structure`, the full path is kept
+/// (e.g. `apk/game.apk`).
+/// With filters and without either flag, only the basename is used (e.g. `game.apk`).
+pub fn resolve_local_download_path(
+    archive_path: &str,
+    keep_folder_structure: bool,
+    partial_folder_structure: bool,
+    has_filters: bool,
+) -> (String, bool) {
+    let (sanitized, mut was_modified) = sanitize_filename(archive_path);
+
+    if !has_filters {
+        return (sanitized, was_modified);
+    }
+
+    if keep_folder_structure || partial_folder_structure {
+        return (sanitized, was_modified);
+    }
+
+    let flattened = sanitized
+        .rsplit('/')
+        .next()
+        .filter(|component| !component.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| sanitized.clone());
+
+    if flattened != sanitized {
+        was_modified = true;
+    }
+
+    (flattened, was_modified)
+}
+
+/// Collect every directory path implied by archive file paths.
+///
+/// Parent folders of files are included. Folders that exist in the archive layout
+/// but contain no files in `_files.xml` cannot be listed explicitly by archive.org;
+/// this returns all directory prefixes present in the metadata file list.
+pub fn collect_archive_directories(archive_paths: &[String]) -> Vec<String> {
+    let mut dirs = BTreeSet::new();
+
+    for archive_path in archive_paths {
+        let (sanitized, _) = sanitize_filename(archive_path);
+        let parts: Vec<&str> = sanitized.split('/').filter(|part| !part.is_empty()).collect();
+        if parts.len() <= 1 {
+            continue;
+        }
+        for i in 1..parts.len() {
+            dirs.insert(parts[..i].join("/"));
+        }
+    }
+
+    dirs.into_iter().collect()
+}
+
+/// Create archive directory paths locally (including folders that end up empty).
+pub fn create_archive_directories(directories: &[String]) -> Result<()> {
+    for dir in directories {
+        fs::create_dir_all(dir).map_err(|e| {
+            IaGetError::FileSystem(format!("Failed to create directory '{dir}': {e}"))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -481,5 +831,135 @@ mod tests {
         let (result, modified) = sanitize_filename("file:name.tar.gz");
         assert_eq!(result, "file_name.tar.gz");
         assert!(modified);
+    }
+
+    #[test]
+    fn extension_filters_match_case_insensitive() {
+        let filters =
+            normalize_extension_filters(&["*APK".to_string(), "*XAPK".to_string()]).unwrap();
+        assert!(file_matches_extension_filters("apps/game.APK", &filters));
+        assert!(file_matches_extension_filters("bundle/file.xapk", &filters));
+        assert!(!file_matches_extension_filters("readme.txt", &filters));
+    }
+
+    #[test]
+    fn empty_filters_match_everything() {
+        let filters = normalize_extension_filters(&[]).unwrap();
+        assert!(file_matches_extension_filters("anything.bin", &filters));
+    }
+
+    #[test]
+    fn invalid_filter_must_start_with_star() {
+        assert!(normalize_extension_filters(&["apk".to_string()]).is_err());
+    }
+
+    #[test]
+    fn extension_excludes_match_case_insensitive() {
+        let excludes = normalize_extension_excludes(&["#JPG".to_string(), "#torrent".to_string()])
+            .unwrap();
+        assert!(!file_passes_extension_filters("photo.JPG", &[], &excludes));
+        assert!(!file_passes_extension_filters("data/file.torrent", &[], &excludes));
+        assert!(file_passes_extension_filters("readme.txt", &[], &excludes));
+    }
+
+    #[test]
+    fn empty_excludes_match_everything() {
+        let spec = parse_extension_filters(&[]).unwrap();
+        assert!(file_passes_extension_filters(
+            "anything.bin",
+            &spec.includes,
+            &spec.excludes
+        ));
+    }
+
+    #[test]
+    fn parse_extension_filters_splits_include_and_exclude() {
+        let spec =
+            parse_extension_filters(&["*apk".to_string(), "#jpg".to_string(), "#torrent".to_string()])
+                .unwrap();
+        assert_eq!(spec.includes, vec![".apk"]);
+        assert_eq!(spec.excludes, vec![".jpg", ".torrent"]);
+        assert!(file_passes_extension_filters("game.apk", &spec.includes, &spec.excludes));
+        assert!(!file_passes_extension_filters("cover.jpg", &spec.includes, &spec.excludes));
+        assert!(!file_passes_extension_filters("photo.jpg", &[], &spec.excludes));
+    }
+
+    #[test]
+    fn invalid_filter_must_use_star_or_hash_prefix() {
+        assert!(split_extension_filter_args(&["jpg".to_string()]).is_err());
+    }
+
+    #[test]
+    fn resolve_local_download_path_keeps_structure_when_requested() {
+        let (path, modified) = resolve_local_download_path("apk/game.apk", true, false, true);
+        assert_eq!(path, "apk/game.apk");
+        assert!(!modified);
+    }
+
+    #[test]
+    fn resolve_local_download_path_keeps_structure_for_partial_folder_flag() {
+        let (path, modified) = resolve_local_download_path("apk/game.apk", false, true, true);
+        assert_eq!(path, "apk/game.apk");
+        assert!(!modified);
+    }
+
+    #[test]
+    fn resolve_local_download_path_flattens_filtered_downloads_by_default() {
+        let (path, modified) = resolve_local_download_path("apk/game.apk", false, false, true);
+        assert_eq!(path, "game.apk");
+        assert!(modified);
+    }
+
+    #[test]
+    fn resolve_local_download_path_keeps_structure_without_filters() {
+        let (path, modified) = resolve_local_download_path("apk/game.apk", false, false, false);
+        assert_eq!(path, "apk/game.apk");
+        assert!(!modified);
+    }
+
+    #[test]
+    fn resolve_local_download_path_applies_sanitization_before_flattening() {
+        let (path, modified) = resolve_local_download_path("apk/game?.apk", false, false, true);
+        assert_eq!(path, "game_.apk");
+        assert!(modified);
+    }
+
+    #[test]
+    fn collect_archive_directories_includes_nested_and_empty_parents() {
+        let paths = vec![
+            "apk/game.apk".to_string(),
+            "data/readme.txt".to_string(),
+            "deep/nested/file.zip".to_string(),
+        ];
+        assert_eq!(
+            collect_archive_directories(&paths),
+            vec![
+                "apk".to_string(),
+                "data".to_string(),
+                "deep".to_string(),
+                "deep/nested".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn eta_seconds_matches_aria2_remaining_over_speed() {
+        assert_eq!(eta_seconds(1_000, 100, 50), Some(18));
+        assert_eq!(eta_seconds(1_000, 1_000, 50), None);
+        assert_eq!(eta_seconds(1_000, 100, 0), None);
+    }
+
+    #[test]
+    fn speed_calc_reports_session_bytes_only() {
+        let mut speed = SpeedCalc::new();
+        speed.update(512);
+        speed.update(512);
+        assert_eq!(speed.accumulated_length(), 1024);
+    }
+
+    #[test]
+    fn collect_archive_directories_ignores_root_level_files() {
+        let paths = vec!["readme.txt".to_string(), "cover.jpg".to_string()];
+        assert!(collect_archive_directories(&paths).is_empty());
     }
 }

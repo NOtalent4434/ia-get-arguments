@@ -23,6 +23,10 @@ pub enum IaGetError {
     /// XML parsing errors
     #[error("Failed to parse XML: {0}")]
     XmlParsing(String),
+
+    /// Configuration file errors
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
 impl From<reqwest::Error> for IaGetError {
