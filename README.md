@@ -1,3 +1,7 @@
+<br>
+<h2>For More Information about this fork read <a href="FORK-DOC.md">FORK-DOC.md</a> </h2>
+<br>
+
 <h1 align="center">
   <img src="assets/ia-get.png" width="256" height="256" alt="ia-get">
   <br />
@@ -10,9 +14,7 @@
 </p>
 
 <p align="center">Made with 💝 by 🤖</p>
-<br>
-<h2>For More Information about this fork read <a href="FORK-DOC.md">FORK-DOC.md</a> </h2>
-<br>
+
 # Usage 📖
 
 Simply pass the URL of an [archive.org](https://archive.org) details page you want to download and `ia-get` will automatically get the XML metadata and download all files to the current working directory.
