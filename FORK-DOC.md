@@ -75,11 +75,7 @@ ia-get https://archive.org/details/your-item #jpg #torrent
 ia-get https://archive.org/details/your-item *apk *xapk #xapk
 ```
 
-**Preview what would match before downloading:**
 
-```shell
-ia-get --list https://archive.org/details/your-item *ipa #torrent
-```
 
 If no files match after filtering, the program exits without downloading.
 
