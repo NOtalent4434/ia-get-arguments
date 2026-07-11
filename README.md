@@ -10,7 +10,9 @@
 </p>
 
 <p align="center">Made with 💝 by 🤖</p>
-
+<br>
+<h1>For More Information about this fork read [FORK-DOC.md](https://github.com/NOtalent4434/ia-get-arguments/blob/main/FORK-DOC.md) </h1>
+<br>
 # Usage 📖
 
 Simply pass the URL of an [archive.org](https://archive.org) details page you want to download and `ia-get` will automatically get the XML metadata and download all files to the current working directory.
